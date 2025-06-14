@@ -71,6 +71,7 @@ class vLLMRollout(BaseRollout):
 
         self.inference_engine = LLM(
             model=model_path,
+            seed=config.seed,
             skip_tokenizer_init=False,
             tensor_parallel_size=config.tensor_parallel_size,
             dtype=PrecisionType.to_str(PrecisionType.to_dtype(config.dtype)),

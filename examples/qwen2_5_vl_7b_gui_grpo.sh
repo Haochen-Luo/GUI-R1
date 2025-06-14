@@ -13,7 +13,7 @@ python3 -m verl.trainer.main \
     worker.rollout.enable_chunked_prefill=false \
     worker.reward.compute_score=r1gui \
     trainer.experiment_name=qwen2_5_vl_7b_guir1_grpo \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=6 \
     data.max_pixels=1258291 \
     data.max_prompt_length=2048 \
     data.max_response_length=1024 \
