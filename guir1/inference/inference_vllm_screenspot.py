@@ -9,33 +9,26 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import argparse
 import re
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
 from io import BytesIO
 from datasets import load_dataset
 from datasets import Dataset as hf_dataset
-# 初始化 Ray
+import random
+
 ray.init()
 
-# 模型路径
 MODEL_PATH = ""
-
-# 推理参数
 SAMPLING_PARAMS = SamplingParams(
     temperature=0.0,
     top_p=0.001,
     repetition_penalty=1.05,
-    max_tokens=1024,  # 根据需要调整最大生成长度
-    stop_token_ids=[],  # 停止标志
+    max_tokens=1024,
+    stop_token_ids=[],
 )
-
-# 数据路径
 DATA_PATH = ""
-
-# 微批大小
 MICRO_BATCH = 6
 
 def extract_coord(content):
-    # Try to find the bbox within <answer> tags, if can not find, return [0, 0, 0, 0]
     answer_tag_pattern = r'<answer>(.*?)</answer>'
     bbox_pattern = r'\{.*\[(\d+),\s*(\d+)]\s*.*\}'
     content_answer_match = re.search(answer_tag_pattern, content, re.DOTALL)
@@ -55,35 +48,95 @@ def extract_coord(content):
         return [0, 0, 0, 0], False
     except:
         return [0, 0, 0, 0], False
-    
+
+# ---- Perturbation functions ----
+def perturb_icon(image, bbox, perturb_type):
+    x1, y1, x2, y2 = map(int, bbox)
+    icon_crop = image.crop((x1, y1, x2, y2))
+
+    if perturb_type == "none":
+        return image
+
+    elif perturb_type == "blackdot":
+        draw = ImageDraw.Draw(icon_crop)
+        for _ in range(max(3, (x2-x1)//15)):
+            cx = random.randint(0, x2-x1-1)
+            cy = random.randint(0, y2-y1-1)
+            r = max(1, (min(x2-x1, y2-y1)) // 8)
+            draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=(0,0,0,255))
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    elif perturb_type == "flip":
+        icon_crop = icon_crop.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    elif perturb_type == "blur":
+        icon_crop = icon_crop.filter(ImageFilter.GaussianBlur(radius=3))
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    elif perturb_type == "jitter":
+        enhancer = ImageEnhance.Color(icon_crop)
+        icon_crop = enhancer.enhance(random.uniform(0.4, 2.2))
+        enhancer = ImageEnhance.Brightness(icon_crop)
+        icon_crop = enhancer.enhance(random.uniform(0.6, 1.5))
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    elif perturb_type == "occlude":
+        overlay = Image.new('RGBA', icon_crop.size, (0,0,0,100))
+        icon_crop = Image.alpha_composite(icon_crop.convert("RGBA"), overlay)
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    elif perturb_type == "pixelate":
+        w, h = icon_crop.size
+        icon_crop = icon_crop.resize((max(1,w//6), max(1,h//6)), resample=Image.NEAREST)
+        icon_crop = icon_crop.resize((w, h), resample=Image.NEAREST)
+        image.paste(icon_crop, (x1, y1))
+        return image
+
+    else:
+        return image
+
 class MultiModalDataset(Dataset):
-    def __init__(self, data, processor):
+    def __init__(self, data, processor, perturb_type):
         self.data = data
         self.processor = processor
+        self.perturb_type = perturb_type
         self.processor.max_pixels=2097152
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        """返回单个样本，包含预处理后的数据"""
         sample = self.data[idx]
         image = sample["image"]
         image = Image.open(BytesIO(image["bytes"]))
         text = sample["instruction"]
 
-        # sys_prompt='''A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> nd <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>'''
+        # -- If bbox available and icon perturbation requested --
+        if "gt_bbox" in sample and self.perturb_type != "none":
+            bbox = sample["gt_bbox"]
+            if isinstance(bbox, str):
+                import re
+                bbox = list(map(int, re.findall(r'\d+', bbox)))
+            if len(bbox) == 4:
+                image = perturb_icon(image, bbox, self.perturb_type)
+        # END PERTURBATION
+
         text=(
-                f"You are RUN1-R1, a reasoning GUI Agent Assistant. In this UI screenshot <image>, I want you to continue executing the command '{text}', with the action history being 'None'.\n"
-                "Please provide the action to perform (enumerate from ['click']), the point where the cursor is moved to (integer) if a click is performed, and any input text required to complete the action.\n"
-                "Output the thinking process in <think> </think> tags, and the final answer in <answer> </answer> tags as follows:\n"
-                "<think> ... </think> <answer>[{'action': enum[ 'click'], 'point': [x, y], 'input_text': 'no input text [default]'}]</answer>\n"
-                "Example:\n"
-                "[{'action': enum['click'], 'point': [123, 300], 'input_text': 'no input text'}]\n"
+            f"You are RUN1-R1, a reasoning GUI Agent Assistant. In this UI screenshot <image>, I want you to continue executing the command '{text}', with the action history being 'None'.\n"
+            "Please provide the action to perform (enumerate from ['click']), the point where the cursor is moved to (integer) if a click is performed, and any input text required to complete the action.\n"
+            "Output the thinking process in <think> </think> tags, and the final answer in <answer> </answer> tags as follows:\n"
+            "<think> ... </think> <answer>[{'action': enum[ 'click'], 'point': [x, y], 'input_text': 'no input text [default]'}]</answer>\n"
+            "Example:\n"
+            "[{'action': enum['click'], 'point': [123, 300], 'input_text': 'no input text'}]\n"
         )
         text = '<image>\n' + text
         message = [
-            # {"role":"system", "content": sys_prompt},
             {
                 "role": "user",
                 "content": [
@@ -93,30 +146,22 @@ class MultiModalDataset(Dataset):
             }
         ]
 
-        # 生成推理所需的 prompt 和多模态输入
         prompt = self.processor.apply_chat_template(
             message,
             tokenize=False,
             add_generation_prompt=True,
         )
 
-        # prompt.replace("<|vision_start|><|image_pad|><|vision_end|>","")
-        # prompt.replace("<image>","<|vision_start|><|image_pad|><|vision_end|>")
-
         image_inputs, video_inputs, video_kwargs = process_vision_info(message, return_video_kwargs=True)
-
-
         inputs = self.processor(
-                    text=[prompt],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-        
+            text=[prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
         resized_height = inputs['image_grid_thw'][0][1] * self.processor.image_processor.patch_size
         resized_width = inputs['image_grid_thw'][0][2] * self.processor.image_processor.patch_size
-              
         origin_height = image_inputs[0].size[1]
         origin_width = image_inputs[0].size[0]
         scale_x = origin_width / resized_width
@@ -140,7 +185,6 @@ class MultiModalDataset(Dataset):
             "original_sample": sample,
         }
 
-
 def custom_collate_fn(batch):
     collated_batch = {
         "prompts": [],
@@ -154,7 +198,6 @@ def custom_collate_fn(batch):
         collated_batch["mm_processor_kwargs"].append(item["mm_processor_kwargs"])
         collated_batch["original_samples"].append(item["original_sample"])
     return collated_batch
-
 
 @ray.remote(num_gpus=1)
 class Worker:
@@ -182,11 +225,7 @@ class Worker:
                 }
                 for prompt, mm_data, mm_kwargs in zip(prompts, multi_modal_data, mm_processor_kwargs)
             ]
-
-            # 执行推理
             outputs = self.llm.generate(llm_inputs, sampling_params=self.sampling_params)
-
-            # 保存结果
             for original_sample, output in zip(original_samples, outputs):
                 generated_text = output.outputs[0].text
                 gt_bbox = original_sample["gt_bbox"]
@@ -195,52 +234,46 @@ class Worker:
                 original_sample["pred_coord"] = [pred_coord[0]*original_sample["scale"][0],pred_coord[1]*original_sample["scale"][1]]
                 original_sample["scale"]=[]
                 original_sample["image"]=''
+                original_sample["perturb_type"] = args.perturb_type
                 results.append(original_sample)
-
         return results
 
-
 def main(args):
-    # 将数据分成 8 份
-    MODEL_PATH=args.model_path
-    DATA_PATH=args.data_path
+    MODEL_PATH = args.model_path
+    DATA_PATH = args.data_path
     if DATA_PATH.endswith('parquet'):
         data=load_dataset("parquet", data_files=DATA_PATH, split="train")
     else:
         data = [json.loads(s) for s in open(DATA_PATH, "r")] if DATA_PATH.endswith(".jsonl") else json.load(open(DATA_PATH,"r"))
-    # 输出路径
     OUTPUT_DIR = args.output_path
     num_actors = args.num_actor
     OUTPUT_DIR = os.path.join(OUTPUT_DIR,MODEL_PATH.split('/')[-1])
-    NEW_FILE = os.path.join(OUTPUT_DIR, DATA_PATH.split("/")[-1].replace(".jsonl", "_pred.jsonl").replace('.parquet','.json'))
+    basename = DATA_PATH.split("/")[-1]
+    if basename.endswith(".jsonl"):
+        basename = basename.replace(".jsonl", f"_pred_{args.perturb_type}.json")
+    elif basename.endswith(".parquet"):
+        basename = basename.replace(".parquet", f"_pred_{args.perturb_type}.json")
+    else:
+        basename = f"{basename}_pred_{args.perturb_type}.json"
+    NEW_FILE = os.path.join(OUTPUT_DIR, basename)
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     data_chunks = [hf_dataset.from_dict(data[i::num_actors]) for i in range(num_actors)]
 
-
-    # 加载处理器
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
-    # processor.max_pixels=1048576
-    # processor.min_pixels=
-
-    # 创建 8 个 Actor，每个 Actor 分配到一个 GPU
     workers = [Worker.remote(MODEL_PATH, SAMPLING_PARAMS) for _ in range(num_actors)]
 
-    # 使用 PyTorch Dataset 和 DataLoader
     futures = []
     for i, chunk in enumerate(data_chunks):
-        dataset = MultiModalDataset(chunk, processor)
+        dataset = MultiModalDataset(chunk, processor, args.perturb_type)
         dataloader = DataLoader(dataset, batch_size=MICRO_BATCH, shuffle=False, num_workers=4, collate_fn=custom_collate_fn)
         futures.append(workers[i].process_data.remote(dataloader))
 
-    # 收集所有结果
     all_results = ray.get(futures)
-
-    # 将结果写入文件
     with open(NEW_FILE, "w") as ans_file:
         for worker_results in all_results:
             for sample in worker_results:
                 ans_file.write(json.dumps(sample) + "\n")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -248,5 +281,8 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, default="<data_path>")
     parser.add_argument('--output_path', type=str, default='./outputs')
     parser.add_argument('--num_actor', type=int, default=8)
+    parser.add_argument('--perturb_type', type=str, default='none',
+                        choices=['none', 'blackdot', 'flip', 'blur', 'jitter', 'occlude', 'pixelate'],
+                        help='Type of icon perturbation to apply')
     args = parser.parse_args()
     main(args)
