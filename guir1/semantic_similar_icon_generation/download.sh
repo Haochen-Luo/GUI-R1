@@ -1,0 +1,1 @@
+wget https://huggingface.co/datasets/ritzzai/GUI-R1/resolve/main/screenspot_test.parquet?download=true
